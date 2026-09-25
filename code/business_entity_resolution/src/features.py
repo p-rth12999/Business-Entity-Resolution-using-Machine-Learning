@@ -15,7 +15,7 @@ import config
 
 BLOCKING_RULES = [
     "exact_name", "postal_name_token", "house_number_address_overlap",
-    "country_name_prefix", "tfidf_nn",
+    "country_name_prefix", "sorted_neighborhood_name", "sorted_neighborhood_address",
 ]
 
 _JOIN_COLS = [
@@ -74,20 +74,24 @@ def _join_side(pairs: pd.DataFrame, s1: pd.DataFrame, cand_by_source: dict) -> p
 
 
 def extract_features(pairs: pd.DataFrame, s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame) -> pd.DataFrame:
+    import time
+    start = time.time()
     df = _join_side(pairs, s1, {"S2": s2, "S3": s3})
+    print(f"  Joined {len(df)} candidate pairs to their records ({time.time() - start:.1f}s)")
 
-    # Name features
+    # Name features — zip-based list comprehensions instead of apply(axis=1),
+    # which is one of the slowest patterns in pandas at millions of rows.
     df["name_exact"] = (df["name_normalized_s1"] == df["name_normalized_cand"]).astype(int)
     df["name_stripped_exact"] = (df["name_stripped_s1"] == df["name_stripped_cand"]).astype(int)
-    df["name_jaccard"] = df.apply(lambda r: _token_jaccard(r["name_normalized_s1"], r["name_normalized_cand"]), axis=1)
-    df["name_levenshtein"] = df.apply(lambda r: fuzz.ratio(r["name_normalized_s1"], r["name_normalized_cand"]) / 100, axis=1)
-    df["name_jaro_winkler"] = df.apply(lambda r: JaroWinkler.normalized_similarity(r["name_normalized_s1"], r["name_normalized_cand"]), axis=1)
+    df["name_jaccard"] = [_token_jaccard(a, b) for a, b in zip(df["name_normalized_s1"], df["name_normalized_cand"])]
+    df["name_levenshtein"] = [fuzz.ratio(a, b) / 100 for a, b in zip(df["name_normalized_s1"], df["name_normalized_cand"])]
+    df["name_jaro_winkler"] = [JaroWinkler.normalized_similarity(a, b) for a, b in zip(df["name_normalized_s1"], df["name_normalized_cand"])]
     df["name_tfidf_cosine"] = _pairwise_tfidf_cosine(df["name_normalized_s1"], df["name_normalized_cand"])
 
     # Address features
     df["address_exact"] = (df["address_normalized_s1"] == df["address_normalized_cand"]).astype(int)
-    df["address_jaccard"] = df.apply(lambda r: _set_jaccard(r["address_tokens_s1"], r["address_tokens_cand"]), axis=1)
-    df["address_levenshtein"] = df.apply(lambda r: fuzz.ratio(r["address_normalized_s1"], r["address_normalized_cand"]) / 100, axis=1)
+    df["address_jaccard"] = [_set_jaccard(a, b) for a, b in zip(df["address_tokens_s1"], df["address_tokens_cand"])]
+    df["address_levenshtein"] = [fuzz.ratio(a, b) / 100 for a, b in zip(df["address_normalized_s1"], df["address_normalized_cand"])]
 
     df["postal_match"] = ((df["postal_code_s1"] != "") & (df["postal_code_s1"] == df["postal_code_cand"])).astype(int)
     df["house_number_match"] = ((df["house_number_s1"] != "") & (df["house_number_s1"] == df["house_number_cand"])).astype(int)
@@ -109,6 +113,7 @@ def extract_features(pairs: pd.DataFrame, s1: pd.DataFrame, s2: pd.DataFrame, s3
     df["strong_name_and_postal"] = ((df["name_levenshtein"] > 0.8) & (df["postal_match"] == 1)).astype(int)
     df["strong_address_and_country"] = ((df["address_levenshtein"] > 0.8) & (df["country_match"] == 1)).astype(int)
 
+    print(f"  Feature extraction done ({time.time() - start:.1f}s total)")
     return df
 
 

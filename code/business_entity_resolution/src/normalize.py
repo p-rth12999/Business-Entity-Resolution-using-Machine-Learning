@@ -4,24 +4,26 @@ Normalization (Step 2).
 Decided: keep BOTH a normalized name and a legal-suffix-stripped name —
 never suffix-stripped-only. Also derives the keys blocking.py needs:
 postal_code, house_number, name_first_token, name_prefix.
+
+Vectorized with pandas .str accessors instead of row-wise .apply(pd.Series) —
+at millions of rows, that pattern is one of the slowest things in pandas.
+This does the same normalization, just fast enough to actually finish.
 """
 
 import re
 import unicodedata
-from typing import List
 
 import pandas as pd
 
 import config
 
-# Legal-suffix tokens stripped for the *stripped* name representation only.
-# Stripping repeats from the end so "pvt ltd" (two suffix tokens) is fully removed.
-LEGAL_SUFFIXES = {
+LEGAL_SUFFIXES = [
     "pvt", "private", "ltd", "limited", "llc", "inc", "incorporated",
     "corp", "corporation", "co", "company", "llp", "plc", "gmbh", "sa", "sarl",
-}
+]
+# Matches one or more trailing suffix tokens in a single pass (handles "pvt ltd")
+_SUFFIX_RE = re.compile(r"(?:\s+(?:" + "|".join(LEGAL_SUFFIXES) + r"))+$")
 
-# Applied to both name and address tokens.
 ABBREVIATIONS = {
     "rd": "road", "st": "street", "ave": "avenue", "blvd": "boulevard",
     "dr": "drive", "ln": "lane", "apt": "apartment", "bldg": "building",
@@ -29,82 +31,78 @@ ABBREVIATIONS = {
 
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WS_RE = re.compile(r"\s+")
-_DIGIT_RE = re.compile(r"\d+")
 
 
-def _basic_clean(text) -> str:
-    if pd.isna(text):
-        return ""
-    text = str(text).lower()
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    text = _PUNCT_RE.sub(" ", text)
-    text = _WS_RE.sub(" ", text).strip()
-    return text
+def _basic_clean_series(series: pd.Series) -> pd.Series:
+    s = series.fillna("").astype(str).str.lower()
+    # Unicode fold (accented -> plain ascii) has no vectorized pandas
+    # equivalent — but this is now the ONLY row-wise step, a single cheap
+    # operation per row, not a whole dict of derived fields per row.
+    s = s.map(lambda t: unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode("ascii"))
+    s = s.str.replace(_PUNCT_RE, " ", regex=True)
+    s = s.str.replace(_WS_RE, " ", regex=True).str.strip()
+    return s
 
 
-def _expand_abbreviations(tokens: List[str]) -> List[str]:
-    return [ABBREVIATIONS.get(tok, tok) for tok in tokens]
+def _expand_abbreviations_series(series: pd.Series) -> pd.Series:
+    for abbr, full in ABBREVIATIONS.items():
+        series = series.str.replace(rf"\b{abbr}\b", full, regex=True)
+    return series
 
 
-def normalize_name(raw_name) -> dict:
-    cleaned = _basic_clean(raw_name)
-    tokens = _expand_abbreviations(cleaned.split())
-    normalized = " ".join(tokens)
+def normalize_names(raw_names: pd.Series) -> pd.DataFrame:
+    normalized = _expand_abbreviations_series(_basic_clean_series(raw_names))
+    stripped = normalized.str.replace(_SUFFIX_RE, "", regex=True).str.strip()
+    stripped = stripped.where(stripped != "", normalized)  # don't over-strip to empty
 
-    stripped_tokens = list(tokens)
-    while stripped_tokens and stripped_tokens[-1] in LEGAL_SUFFIXES:
-        stripped_tokens.pop()
-    stripped = " ".join(stripped_tokens) if stripped_tokens else normalized
-
-    return {
+    return pd.DataFrame({
         "name_normalized": normalized,
         "name_stripped": stripped,
-        "name_first_token": tokens[0] if tokens else "",
-        "name_prefix": normalized.replace(" ", "")[:4],
-    }
+        "name_first_token": normalized.str.split().str[0].fillna(""),
+        "name_prefix": normalized.str.replace(" ", "", regex=False).str.slice(0, 4),
+    })
 
 
-def normalize_address(raw_address) -> dict:
-    cleaned = _basic_clean(raw_address)
-    tokens = _expand_abbreviations(cleaned.split())
-    normalized = " ".join(tokens)
+def normalize_addresses(raw_addresses: pd.Series) -> pd.DataFrame:
+    normalized = _expand_abbreviations_series(_basic_clean_series(raw_addresses))
+    digit_groups = normalized.str.findall(r"\d+")
 
-    digit_groups = _DIGIT_RE.findall(cleaned)
-    house_number = digit_groups[0] if digit_groups else ""
-    # Longest digit group as postal-code heuristic (6-digit Indian PIN, 5-digit
-    # US ZIP). Flag for the researcher: France uses 5-digit codes too — worth
-    # a sanity check once test data is in hand.
-    postal_code = max(digit_groups, key=len) if digit_groups else ""
+    house_number = digit_groups.map(lambda g: g[0] if isinstance(g, list) and g else "")
+    postal_code = digit_groups.map(lambda g: max(g, key=len) if isinstance(g, list) and g else "")
+    address_tokens = normalized.str.split().map(lambda toks: set(toks) if isinstance(toks, list) else set())
 
-    return {
+    return pd.DataFrame({
         "address_normalized": normalized,
-        "address_tokens": set(tokens),
+        "address_tokens": address_tokens,
         "house_number": house_number,
         "postal_code": postal_code,
-    }
+    })
 
 
-def normalize_country(raw_country) -> str:
-    return _basic_clean(raw_country)
+def normalize_country(raw_countries: pd.Series) -> pd.Series:
+    return _basic_clean_series(raw_countries)
 
 
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Adds normalized columns to a COPY of df — raw fields are kept untouched
     for feature extraction later."""
     df = df.copy()
-
-    name_parts = df[config.COL_NAME].apply(normalize_name).apply(pd.Series)
-    address_parts = df[config.COL_ADDRESS].apply(normalize_address).apply(pd.Series)
-
-    df = pd.concat([df, name_parts, address_parts], axis=1)
-    df["country_normalized"] = df[config.COL_COUNTRY].apply(normalize_country)
+    df = pd.concat([
+        df,
+        normalize_names(df[config.COL_NAME]),
+        normalize_addresses(df[config.COL_ADDRESS]),
+    ], axis=1)
+    df["country_normalized"] = normalize_country(df[config.COL_COUNTRY])
     return df
 
 
 if __name__ == "__main__":
+    import time
     import io_utils
 
     s1, _, _ = io_utils.load_train_sources()
+    start = time.time()
     s1_norm = normalize_dataframe(s1)
+    print(f"Normalized {len(s1_norm)} rows in {time.time() - start:.1f}s")
     print(s1_norm[[config.COL_NAME, "name_normalized", "name_stripped",
                    config.COL_ADDRESS, "house_number", "postal_code"]].head())

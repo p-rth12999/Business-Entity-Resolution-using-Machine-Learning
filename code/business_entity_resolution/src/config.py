@@ -77,8 +77,25 @@ DEFAULT_THRESHOLD = 0.5  # placeholder until threshold.py tunes it on validation
 POSTAL_CODE_BLOCK_ENABLED = True
 HOUSE_NUMBER_BLOCK_ENABLED = True
 NAME_PREFIX_BLOCK_ENABLED = True
-TFIDF_FALLBACK_BLOCK_ENABLED = True
-TFIDF_FALLBACK_TOP_K = 5  # nearest neighbors per record for the fuzzy fallback block
+
+# Disabled by default: at this data scale (millions of rows per source),
+# brute-force TF-IDF nearest neighbors does not finish in reasonable time.
+# Replaced below by sorted-neighborhood blocking, which scales to millions.
+TFIDF_FALLBACK_BLOCK_ENABLED = False
+TFIDF_FALLBACK_TOP_K = 5  # kept for reference / possible small-scale reuse
+
+# Scalable fuzzy fallback: sort combined records by a normalized key, only
+# compare records within a sliding window of each other (O(n log n), not
+# O(n*m)). Run twice — sorted by name, then by address — so a typo early in
+# one field can still be caught via the other.
+SORTED_NEIGHBORHOOD_BLOCK_ENABLED = True
+SORTED_NEIGHBORHOOD_WINDOW = 10
+
+# Safety cap: an exact-key block whose key is shared by more than this many
+# records (on either side) gets dropped for that key. Without this, one
+# generic key value (a common house number, an empty-ish name token) can
+# turn into a many-to-many join of tens of millions of pairs by itself.
+MAX_BLOCK_KEY_FREQUENCY = 50
 
 # Negative sampling (Step 3) — decided: hard negatives only (from blocking output)
 USE_RANDOM_NEGATIVES = False

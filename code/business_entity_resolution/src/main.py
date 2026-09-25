@@ -20,12 +20,16 @@ import predict
 
 
 def _load_and_prep_train():
+    import time
+
     s1, s2, s3 = io_utils.load_train_sources()
     gt = io_utils.load_ground_truth()
 
+    start = time.time()
     s1n = normalize.normalize_dataframe(s1)
     s2n = normalize.normalize_dataframe(s2)
     s3n = normalize.normalize_dataframe(s3)
+    print(f"Normalized all sources in {time.time() - start:.1f}s")
 
     candidates = blocking.generate_all_candidates(s1n, s2n, s3n)
     blocking.measure_blocking_recall(candidates, gt)

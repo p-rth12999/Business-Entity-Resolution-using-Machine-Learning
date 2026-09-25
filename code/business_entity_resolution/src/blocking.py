@@ -8,7 +8,9 @@ the classifier makes the precision call later.
 """
 
 from typing import List
+import time
 
+import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
@@ -31,12 +33,27 @@ def _prep(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _drop_overly_common_keys(df: pd.DataFrame, keys: List[str], max_freq: int) -> pd.DataFrame:
+    """Drop rows whose key combination is shared by more than max_freq rows
+    in this dataframe. A generic key value would otherwise blow the join up
+    combinatorially — this is what makes blocking safe at millions of rows."""
+    if df.empty:
+        return df
+    counts = df.groupby(keys)[keys[0]].transform("size")
+    return df[counts <= max_freq]
+
+
 def _merge_block(s1: pd.DataFrame, cand: pd.DataFrame, keys: List[str], rule: str) -> pd.DataFrame:
     left = s1[[config.COL_ENTITY_ID] + keys].copy()
     right = cand[[config.COL_ENTITY_ID] + keys].copy()
     for k in keys:
         left = left[left[k] != ""]
         right = right[right[k] != ""]
+
+    left = _drop_overly_common_keys(left, keys, config.MAX_BLOCK_KEY_FREQUENCY)
+    right = _drop_overly_common_keys(right, keys, config.MAX_BLOCK_KEY_FREQUENCY)
+    if left.empty or right.empty:
+        return pd.DataFrame(columns=["s1_id", "candidate_id", "rule"])
 
     merged = left.merge(right, on=keys, suffixes=("_s1", "_cand"))
     if merged.empty:
@@ -68,6 +85,11 @@ def block_house_number_address_overlap(s1: pd.DataFrame, cand: pd.DataFrame) -> 
     left = left[left["house_number"] != ""]
     right = cand[[config.COL_ENTITY_ID, "house_number", "address_tokens"]]
     right = right[right["house_number"] != ""]
+
+    left = _drop_overly_common_keys(left, ["house_number"], config.MAX_BLOCK_KEY_FREQUENCY)
+    right = _drop_overly_common_keys(right, ["house_number"], config.MAX_BLOCK_KEY_FREQUENCY)
+    if left.empty or right.empty:
+        return pd.DataFrame(columns=["s1_id", "candidate_id", "rule"])
 
     merged = left.merge(right, on="house_number", suffixes=("_s1", "_cand"))
     if merged.empty:
@@ -123,16 +145,86 @@ def block_tfidf_nearest_neighbors(s1: pd.DataFrame, cand: pd.DataFrame, top_k: i
     return pairs.drop_duplicates()
 
 
+def block_sorted_neighborhood(s1: pd.DataFrame, cand: pd.DataFrame, sort_column: str, rule_name: str,
+                               window: int = None) -> pd.DataFrame:
+    """Scalable fuzzy fallback. Sort S1 + candidate records together by a
+    normalized key, then only compare records within a sliding window of
+    each other — O((n+m) log(n+m)) instead of brute-force O(n*m). This is
+    what actually scales to millions of rows; nearest-neighbor search over
+    the full TF-IDF matrix does not.
+
+    Fully vectorized with numpy (no per-row Python loop): for each window
+    offset d, shift the sorted array by d and compare in bulk.
+    """
+    if not config.SORTED_NEIGHBORHOOD_BLOCK_ENABLED:
+        return pd.DataFrame(columns=["s1_id", "candidate_id", "rule"])
+    window = window or config.SORTED_NEIGHBORHOOD_WINDOW
+
+    left = s1[[config.COL_ENTITY_ID, sort_column]].rename(columns={config.COL_ENTITY_ID: "id", sort_column: "key"})
+    left["is_s1"] = True
+    right = cand[[config.COL_ENTITY_ID, sort_column]].rename(columns={config.COL_ENTITY_ID: "id", sort_column: "key"})
+    right["is_s1"] = False
+
+    combined = pd.concat([left, right], ignore_index=True)
+    combined = combined[combined["key"] != ""]  # an empty key isn't meaningfully sortable
+    combined = combined.sort_values("key", kind="mergesort").reset_index(drop=True)
+
+    ids = combined["id"].to_numpy()
+    is_s1 = combined["is_s1"].to_numpy()
+    n = len(combined)
+
+    s1_hits, cand_hits = [], []
+    for d in range(1, min(window, n - 1) + 1):
+        a_is_s1, b_is_s1 = is_s1[:-d], is_s1[d:]
+        a_ids, b_ids = ids[:-d], ids[d:]
+
+        mask_ab = a_is_s1 & ~b_is_s1  # a is S1, b is candidate
+        s1_hits.append(a_ids[mask_ab])
+        cand_hits.append(b_ids[mask_ab])
+
+        mask_ba = ~a_is_s1 & b_is_s1  # a is candidate, b is S1
+        s1_hits.append(b_ids[mask_ba])
+        cand_hits.append(a_ids[mask_ba])
+
+    if not s1_hits:
+        return pd.DataFrame(columns=["s1_id", "candidate_id", "rule"])
+
+    pairs_df = pd.DataFrame({
+        "s1_id": np.concatenate(s1_hits),
+        "candidate_id": np.concatenate(cand_hits),
+    }).drop_duplicates()
+    pairs_df["rule"] = rule_name
+    return pairs_df
+
+
+def block_sorted_neighborhood_name(s1: pd.DataFrame, cand: pd.DataFrame) -> pd.DataFrame:
+    return block_sorted_neighborhood(s1, cand, "name_normalized", "sorted_neighborhood_name")
+
+
+def block_sorted_neighborhood_address(s1: pd.DataFrame, cand: pd.DataFrame) -> pd.DataFrame:
+    return block_sorted_neighborhood(s1, cand, "address_normalized", "sorted_neighborhood_address")
+
+
 def generate_candidates_for_source(s1: pd.DataFrame, cand: pd.DataFrame, source_label: str) -> pd.DataFrame:
     s1, cand = _prep(s1), _prep(cand)
 
-    blocks = [
-        block_exact_name(s1, cand),
-        block_postal_name_token(s1, cand),
-        block_house_number_address_overlap(s1, cand),
-        block_country_name_prefix(s1, cand),
-        block_tfidf_nearest_neighbors(s1, cand),
+    block_fns = [
+        ("exact_name", block_exact_name),
+        ("postal_name_token", block_postal_name_token),
+        ("house_number_address_overlap", block_house_number_address_overlap),
+        ("country_name_prefix", block_country_name_prefix),
+        ("sorted_neighborhood_name", block_sorted_neighborhood_name),
+        ("sorted_neighborhood_address", block_sorted_neighborhood_address),
     ]
+
+    blocks = []
+    for name, fn in block_fns:
+        start = time.time()
+        result = fn(s1, cand)
+        elapsed = time.time() - start
+        print(f"  [{source_label}] {name}: {len(result)} pairs ({elapsed:.1f}s)")
+        blocks.append(result)
+
     combined = pd.concat(blocks, ignore_index=True)
     if combined.empty:
         return pd.DataFrame(columns=["s1_id", "candidate_id", "candidate_source", "blocking_rules"])
