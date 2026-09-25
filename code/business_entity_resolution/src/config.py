@@ -40,6 +40,7 @@ CANDIDATE_PAIRS_FILE = OUTPUT_DIR / "candidate_pairs.tsv"
 MATCHING_RESULTS_FILE = OUTPUT_DIR / "matching_results.tsv"
 
 MODEL_FILE = MODELS_DIR / "lightgbm_matcher.txt"
+THRESHOLD_FILE = MODELS_DIR / "threshold.json"
 
 # ---------------------------------------------------------------------------
 # Column names (source tables: entity_id, business_name, business_address, country)

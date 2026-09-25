@@ -15,10 +15,11 @@ import normalize
 import blocking
 import features as feat
 import model
+import threshold as threshold_module
 
 
 def run_test_pipeline(threshold: float = None) -> pd.DataFrame:
-    threshold = threshold if threshold is not None else config.DEFAULT_THRESHOLD
+    threshold = threshold if threshold is not None else threshold_module.load_threshold()
 
     s1, s2, s3 = io_utils.load_test_sources()
     s1n = normalize.normalize_dataframe(s1)

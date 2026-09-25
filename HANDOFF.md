@@ -15,7 +15,7 @@
 | 4 — Blocking | `blocking.py` | Done — 5 rule-based blocks |
 | 5 — Features | `features.py` | Done |
 | 6 — Model | `model.py` | Done — LightGBM, entity-level split |
-| 7 — Threshold tuning | `threshold.py` | **Not started — this is you** |
+| 7 — Threshold tuning | `threshold.py` | Done — coarse+fine sweep, persists to `models/threshold.json` |
 | 8 — Evaluation | `evaluate.py` | Done — macro F0.5, error examples |
 | 9 — Singleton handling | (built into evaluate.py + predict.py) | Done |
 | 10 — Test inference | `predict.py`, `main.py` | Done — untested against real test data yet |
@@ -53,8 +53,7 @@
 
 ## 4. Concrete next steps
 
-1. Run `python main.py train` and `python main.py evaluate` — fill in Section 2 above.
-2. **Build `threshold.py`:** don't just eyeball the sweep — persist the chosen threshold (e.g. write it to a small json/config value) so `predict.py` uses the tuned number instead of the hardcoded default.
+1. Run `python main.py train`, then `python threshold.py` to persist the tuned threshold — `predict.py` picks it up automatically after that (falls back to 0.5 with a warning if no tuned threshold exists yet). Fill in Section 2 above with the numbers it prints.
 3. **If blocking recall is low:** check which block is weak — `evaluate.get_error_examples()` and the `blocking_rules` column will show which rule(s) fired (or didn't) for missed matches.
 4. **If blocking recall is high but F0.5 is low:** it's a feature/model problem — pull false positives and false negatives via `evaluate.get_error_examples()` and look for patterns.
 5. **Per-source threshold split (S2 vs S3):** only pursue this if validation shows a real, consistent score-distribution gap between the two — see decision #5 in the methodology doc.
