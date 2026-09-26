@@ -1,91 +1,98 @@
 """
-Threshold selection (Step 7).
+LightGBM matcher (Step 6).
 
-Takes the sweep evaluate.py can already compute and turns it into a single,
-persisted threshold that predict.py actually uses — instead of the
-hardcoded config.DEFAULT_THRESHOLD placeholder.
-
-Decided: single global threshold (not per-source) unless validation shows a
-real, consistent gap between S2 and S3 score distributions.
+Decided: LightGBM. Validation split is by Source-1 entity (GroupKFold on
+s1_id) — never split by pair, or related pairs leak across train/valid.
 """
 
-import json
 from pathlib import Path
-from typing import Set
+from typing import Set, Tuple
 
+import lightgbm as lgb
+import numpy as np
 import pandas as pd
+from sklearn.model_selection import KFold
 
 import config
-import evaluate
+import features as feat
 
 
-def sweep_thresholds(scored: pd.DataFrame, ground_truth: pd.DataFrame, entity_ids: Set[str],
-                      candidates=None) -> pd.DataFrame:
-    candidates = candidates or config.THRESHOLD_SWEEP
-    rows = [evaluate.evaluate_at_threshold(scored, ground_truth, entity_ids, t) for t in candidates]
-    return pd.DataFrame(rows).sort_values("macro_f0.5", ascending=False).reset_index(drop=True)
+def split_entity_ids(ground_truth: pd.DataFrame, n_splits: int = None) -> Tuple[Set[str], Set[str]]:
+    """Splits ALL Source-1 entity IDs — not just ones that survived blocking —
+    into train/valid. This matters: an entity with zero candidates still has
+    to be evaluated (as an empty prediction), or macro-F0.5 silently ignores
+    it and looks better than the real submission would score."""
+    n_splits = n_splits or config.N_VALIDATION_FOLDS
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=config.RANDOM_SEED)
+    ids = ground_truth[config.COL_S1_ID].to_numpy()
+    train_idx, valid_idx = next(kf.split(ids))
+    return set(ids[train_idx]), set(ids[valid_idx])
 
 
-def refine_best_threshold(scored: pd.DataFrame, ground_truth: pd.DataFrame, entity_ids: Set[str]) -> dict:
-    """Coarse sweep (config.THRESHOLD_SWEEP, 0.05 steps) then a finer sweep
-    around the coarse winner (0.01 steps), so the persisted threshold isn't
-    stuck on a coarse grid."""
-    coarse = sweep_thresholds(scored, ground_truth, entity_ids)
-    best_coarse = coarse.iloc[0]["threshold"]
-
-    fine_candidates = [round(best_coarse - 0.04 + 0.01 * i, 2) for i in range(9)]
-    fine_candidates = [t for t in fine_candidates if 0.0 < t < 1.0]
-    fine = sweep_thresholds(scored, ground_truth, entity_ids, candidates=fine_candidates)
-
-    best = pd.concat([coarse, fine]).sort_values("macro_f0.5", ascending=False).iloc[0]
-    return {"threshold": float(best["threshold"]), "macro_f0.5": float(best["macro_f0.5"])}
+def filter_by_entity_ids(featured: pd.DataFrame, entity_ids: Set[str]) -> pd.DataFrame:
+    return featured[featured["s1_id"].isin(entity_ids)].reset_index(drop=True)
 
 
-def save_threshold(threshold: float, path: Path = None) -> None:
-    path = path or config.THRESHOLD_FILE
-    path.write_text(json.dumps({"threshold": threshold}, indent=2))
-    print(f"Saved tuned threshold ({threshold}) to {path}")
+def train_lightgbm(train_df: pd.DataFrame, valid_df: pd.DataFrame) -> lgb.Booster:
+    X_train, y_train = train_df[feat.FEATURE_COLUMNS], train_df["label"]
+    X_valid, y_valid = valid_df[feat.FEATURE_COLUMNS], valid_df["label"]
+
+    train_set = lgb.Dataset(X_train, label=y_train)
+    valid_set = lgb.Dataset(X_valid, label=y_valid, reference=train_set)
+
+    params = {
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "seed": config.RANDOM_SEED,
+        "verbose": -1,
+    }
+
+    model = lgb.train(
+        params,
+        train_set,
+        num_boost_round=500,
+        valid_sets=[valid_set],
+        callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(period=50)],
+    )
+    return model
 
 
-def load_threshold(path: Path = None) -> float:
-    path = path or config.THRESHOLD_FILE
-    if not path.exists():
-        print(f"No tuned threshold found at {path} — falling back to "
-              f"config.DEFAULT_THRESHOLD ({config.DEFAULT_THRESHOLD}). "
-              f"Run threshold.py to tune and save one.")
-        return config.DEFAULT_THRESHOLD
-    return json.loads(path.read_text())["threshold"]
+def predict_proba(model: lgb.Booster, df: pd.DataFrame) -> np.ndarray:
+    return model.predict(df[feat.FEATURE_COLUMNS], num_iteration=model.best_iteration)
+
+
+def save_model(model: lgb.Booster, path: Path = None) -> None:
+    path = path or config.MODEL_FILE
+    model.save_model(str(path))
+    print(f"Saved model to {path}")
+
+
+def load_model(path: Path = None) -> lgb.Booster:
+    path = path or config.MODEL_FILE
+    return lgb.Booster(model_file=str(path))
 
 
 if __name__ == "__main__":
-    import io_utils
-    import normalize
-    import blocking
     import labels
-    import features as feat
-    import model
+    import pipeline
 
-    s1, s2, s3 = io_utils.load_train_sources()
-    gt = io_utils.load_ground_truth()
-
-    s1n = normalize.normalize_dataframe(s1)
-    s2n = normalize.normalize_dataframe(s2)
-    s3n = normalize.normalize_dataframe(s3)
-
-    candidates = blocking.generate_all_candidates(s1n, s2n, s3n)
+    s1n, s2n, s3n, candidates, gt = pipeline.load_and_prepare()
     labeled, missed = labels.build_pairwise_labels(candidates, gt)
+    labels.summarize_labels(labeled, missed)
+
     featured = feat.extract_features(labeled, s1n, s2n, s3n)
+    train_ids, valid_ids = split_entity_ids(gt)
+    train_df = filter_by_entity_ids(featured, train_ids)
+    valid_df = filter_by_entity_ids(featured, valid_ids)
+    print(f"Train: {len(train_ids)} entities / {len(train_df)} pairs, "
+          f"Valid: {len(valid_ids)} entities / {len(valid_df)} pairs")
 
-    train_ids, valid_ids = model.split_entity_ids(gt)
-    train_df = model.filter_by_entity_ids(featured, train_ids)
-    valid_df = model.filter_by_entity_ids(featured, valid_ids)
+    model = train_lightgbm(train_df, valid_df)
+    save_model(model)
 
-    trained_model = model.train_lightgbm(train_df, valid_df)
     valid_df = valid_df.copy()
-    valid_df["match_probability"] = model.predict_proba(trained_model, valid_df)
-
-    print("\n--- Coarse + fine threshold sweep ---")
-    best = refine_best_threshold(valid_df, gt, valid_ids)
-    print(f"Best threshold: {best['threshold']:.3f}  macro_F0.5: {best['macro_f0.5']:.4f}")
-
-    save_threshold(best["threshold"])
+    valid_df["match_probability"] = predict_proba(model, valid_df)
+    print("\nSample scored validation pairs:")
+    print(valid_df[["s1_id", "candidate_id", "label", "match_probability"]].sample(min(10, len(valid_df))))

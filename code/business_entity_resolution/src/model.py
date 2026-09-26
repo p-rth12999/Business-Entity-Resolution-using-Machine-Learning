@@ -75,19 +75,10 @@ def load_model(path: Path = None) -> lgb.Booster:
 
 
 if __name__ == "__main__":
-    import io_utils
-    import normalize
-    import blocking
     import labels
+    import pipeline
 
-    s1, s2, s3 = io_utils.load_train_sources()
-    gt = io_utils.load_ground_truth()
-
-    s1n = normalize.normalize_dataframe(s1)
-    s2n = normalize.normalize_dataframe(s2)
-    s3n = normalize.normalize_dataframe(s3)
-
-    candidates = blocking.generate_all_candidates(s1n, s2n, s3n)
+    s1n, s2n, s3n, candidates, gt = pipeline.load_and_prepare()
     labeled, missed = labels.build_pairwise_labels(candidates, gt)
     labels.summarize_labels(labeled, missed)
 

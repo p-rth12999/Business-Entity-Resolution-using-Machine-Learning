@@ -12,6 +12,7 @@ import time
 
 import numpy as np
 import pandas as pd
+from rapidfuzz import fuzz
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
 
@@ -19,7 +20,7 @@ import config
 
 REQUIRED_BLOCK_COLUMNS = [
     config.COL_ENTITY_ID, "name_normalized", "name_first_token", "name_prefix",
-    "postal_code", "house_number", "address_tokens", "country_normalized",
+    "postal_code", "house_number", "address_normalized", "country_normalized",
 ]
 
 
@@ -76,14 +77,17 @@ def block_postal_name_token(s1: pd.DataFrame, cand: pd.DataFrame) -> pd.DataFram
 
 
 def block_house_number_address_overlap(s1: pd.DataFrame, cand: pd.DataFrame) -> pd.DataFrame:
-    """Merge on house_number, then require >=1 more shared address token —
-    a bare house-number match ('12') alone is too common to trust."""
+    """Merge on house_number, then require real address similarity beyond
+    just the shared number — a bare house-number match ('12') alone is too
+    common to trust. Uses rapidfuzz's token_set_ratio directly on the
+    normalized address strings (fast, C-level, no stored token objects)
+    instead of Python set intersection, which was 200-400s/source at scale."""
     if not config.HOUSE_NUMBER_BLOCK_ENABLED:
         return pd.DataFrame(columns=["s1_id", "candidate_id", "rule"])
 
-    left = s1[[config.COL_ENTITY_ID, "house_number", "address_tokens"]]
+    left = s1[[config.COL_ENTITY_ID, "house_number", "address_normalized"]]
     left = left[left["house_number"] != ""]
-    right = cand[[config.COL_ENTITY_ID, "house_number", "address_tokens"]]
+    right = cand[[config.COL_ENTITY_ID, "house_number", "address_normalized"]]
     right = right[right["house_number"] != ""]
 
     left = _drop_overly_common_keys(left, ["house_number"], config.MAX_BLOCK_KEY_FREQUENCY)
@@ -95,10 +99,11 @@ def block_house_number_address_overlap(s1: pd.DataFrame, cand: pd.DataFrame) -> 
     if merged.empty:
         return pd.DataFrame(columns=["s1_id", "candidate_id", "rule"])
 
-    overlap_ok = merged.apply(
-        lambda r: len(r["address_tokens_s1"] & r["address_tokens_cand"]) >= 2, axis=1
-    )
-    merged = merged[overlap_ok]
+    scores = [
+        fuzz.token_set_ratio(a, b)
+        for a, b in zip(merged["address_normalized_s1"], merged["address_normalized_cand"])
+    ]
+    merged = merged[pd.Series(scores, index=merged.index) >= 50]
     if merged.empty:
         return pd.DataFrame(columns=["s1_id", "candidate_id", "rule"])
 
@@ -250,17 +255,25 @@ def generate_all_candidates(s1: pd.DataFrame, s2: pd.DataFrame, s3: pd.DataFrame
 
 def measure_blocking_recall(candidates: pd.DataFrame, ground_truth: pd.DataFrame) -> float:
     """Of every true match in the ground truth, what % survived into the
-    candidate set? Most important number before any model gets trained."""
-    candidate_keys = set(zip(candidates["s1_id"], candidates["candidate_id"]))
+    candidate set? Uses a pandas merge (hash join, vectorized) instead of
+    building a Python set of tens of millions of ID-pair tuples — that
+    approach is what actually stalls at this data scale, not blocking itself."""
+    gt_pairs = ground_truth[[config.COL_S1_ID, "matched_ids_list"]].explode("matched_ids_list")
+    gt_pairs = gt_pairs.dropna(subset=["matched_ids_list"]).rename(
+        columns={config.COL_S1_ID: "s1_id", "matched_ids_list": "candidate_id"}
+    )
+    total_matches = len(gt_pairs)
+    if total_matches == 0:
+        print("Blocking recall: 0/0 = 1.0000 (no true matches in ground truth)")
+        return 1.0
 
-    total_matches, found_matches = 0, 0
-    for _, row in ground_truth.iterrows():
-        for match_id in row["matched_ids_list"]:
-            total_matches += 1
-            if (row[config.COL_S1_ID], match_id) in candidate_keys:
-                found_matches += 1
+    found = gt_pairs.merge(
+        candidates[["s1_id", "candidate_id"]].drop_duplicates(),
+        on=["s1_id", "candidate_id"], how="inner",
+    )
+    found_matches = len(found)
 
-    recall = found_matches / total_matches if total_matches else 1.0
+    recall = found_matches / total_matches
     print(f"Blocking recall: {found_matches}/{total_matches} = {recall:.4f}")
     return recall
 

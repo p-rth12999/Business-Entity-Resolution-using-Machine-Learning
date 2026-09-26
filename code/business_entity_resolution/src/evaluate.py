@@ -1,110 +1,98 @@
 """
-Evaluation (Step 8).
+LightGBM matcher (Step 6).
 
-Computes macro F0.5 per Source-1 entity, then averages across entities —
-including entities with zero candidates, which must count as a (correct or
-incorrect) empty prediction rather than being silently skipped.
+Decided: LightGBM. Validation split is by Source-1 entity (GroupKFold on
+s1_id) — never split by pair, or related pairs leak across train/valid.
 """
 
-from typing import Set
+from pathlib import Path
+from typing import Set, Tuple
 
+import lightgbm as lgb
+import numpy as np
 import pandas as pd
+from sklearn.model_selection import KFold
 
 import config
+import features as feat
 
 
-def _f_beta(true_set: set, pred_set: set, beta: float = 0.5) -> float:
-    if not true_set and not pred_set:
-        return 1.0  # singleton correctly identified
-    if not true_set and pred_set:
-        return 0.0  # false merge on a true singleton
-    if true_set and not pred_set:
-        return 0.0  # missed every true match
-
-    intersection = true_set & pred_set
-    precision = len(intersection) / len(pred_set)
-    recall = len(intersection) / len(true_set)
-    if precision + recall == 0:
-        return 0.0
-    beta_sq = beta ** 2
-    return (1 + beta_sq) * precision * recall / (beta_sq * precision + recall)
+def split_entity_ids(ground_truth: pd.DataFrame, n_splits: int = None) -> Tuple[Set[str], Set[str]]:
+    """Splits ALL Source-1 entity IDs — not just ones that survived blocking —
+    into train/valid. This matters: an entity with zero candidates still has
+    to be evaluated (as an empty prediction), or macro-F0.5 silently ignores
+    it and looks better than the real submission would score."""
+    n_splits = n_splits or config.N_VALIDATION_FOLDS
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=config.RANDOM_SEED)
+    ids = ground_truth[config.COL_S1_ID].to_numpy()
+    train_idx, valid_idx = next(kf.split(ids))
+    return set(ids[train_idx]), set(ids[valid_idx])
 
 
-def build_predictions(scored: pd.DataFrame, threshold: float, entity_ids: Set[str]) -> dict:
-    """entity_ids: the FULL set of Source-1 entities being evaluated. An
-    entity with no candidates above threshold (or no candidates at all)
-    still gets an entry, with an empty predicted set."""
-    predictions = {eid: set() for eid in entity_ids}
-    above = scored[scored["match_probability"] >= threshold]
-    for s1_id, group in above.groupby("s1_id"):
-        if s1_id in predictions:
-            predictions[s1_id] = set(group["candidate_id"])
-    return predictions
+def filter_by_entity_ids(featured: pd.DataFrame, entity_ids: Set[str]) -> pd.DataFrame:
+    return featured[featured["s1_id"].isin(entity_ids)].reset_index(drop=True)
 
 
-def evaluate_at_threshold(scored: pd.DataFrame, ground_truth: pd.DataFrame, entity_ids: Set[str], threshold: float) -> dict:
-    predictions = build_predictions(scored, threshold, entity_ids)
-    gt_lookup = ground_truth.set_index(config.COL_S1_ID)["matched_ids_list"].to_dict()
+def train_lightgbm(train_df: pd.DataFrame, valid_df: pd.DataFrame) -> lgb.Booster:
+    X_train, y_train = train_df[feat.FEATURE_COLUMNS], train_df["label"]
+    X_valid, y_valid = valid_df[feat.FEATURE_COLUMNS], valid_df["label"]
 
-    scores = [
-        _f_beta(set(gt_lookup.get(eid, [])), predictions.get(eid, set()))
-        for eid in entity_ids
-    ]
-    macro_f_beta = sum(scores) / len(scores) if scores else 0.0
-    return {"threshold": threshold, "macro_f0.5": macro_f_beta, "n_entities": len(scores)}
+    train_set = lgb.Dataset(X_train, label=y_train)
+    valid_set = lgb.Dataset(X_valid, label=y_valid, reference=train_set)
+
+    params = {
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "learning_rate": 0.05,
+        "num_leaves": 31,
+        "seed": config.RANDOM_SEED,
+        "verbose": -1,
+    }
+
+    model = lgb.train(
+        params,
+        train_set,
+        num_boost_round=500,
+        valid_sets=[valid_set],
+        callbacks=[lgb.early_stopping(stopping_rounds=30), lgb.log_evaluation(period=50)],
+    )
+    return model
 
 
-def get_error_examples(scored: pd.DataFrame, ground_truth: pd.DataFrame, entity_ids: Set[str], threshold: float, n: int = 10):
-    """Returns (false_positives, false_negatives) sample DataFrames for the
-    error-analysis section of the write-up."""
-    predictions = build_predictions(scored, threshold, entity_ids)
-    gt_lookup = ground_truth.set_index(config.COL_S1_ID)["matched_ids_list"].to_dict()
+def predict_proba(model: lgb.Booster, df: pd.DataFrame) -> np.ndarray:
+    return model.predict(df[feat.FEATURE_COLUMNS], num_iteration=model.best_iteration)
 
-    fp_rows, fn_rows = [], []
-    for eid in entity_ids:
-        true_set = set(gt_lookup.get(eid, []))
-        pred_set = predictions.get(eid, set())
-        fp_rows += [{"s1_id": eid, "candidate_id": c} for c in pred_set - true_set]
-        fn_rows += [{"s1_id": eid, "candidate_id": c} for c in true_set - pred_set]
 
-    return pd.DataFrame(fp_rows).head(n), pd.DataFrame(fn_rows).head(n)
+def save_model(model: lgb.Booster, path: Path = None) -> None:
+    path = path or config.MODEL_FILE
+    model.save_model(str(path))
+    print(f"Saved model to {path}")
+
+
+def load_model(path: Path = None) -> lgb.Booster:
+    path = path or config.MODEL_FILE
+    return lgb.Booster(model_file=str(path))
 
 
 if __name__ == "__main__":
-    import io_utils
-    import normalize
-    import blocking
     import labels
-    import features as feat
-    import model
+    import pipeline
 
-    s1, s2, s3 = io_utils.load_train_sources()
-    gt = io_utils.load_ground_truth()
-
-    s1n = normalize.normalize_dataframe(s1)
-    s2n = normalize.normalize_dataframe(s2)
-    s3n = normalize.normalize_dataframe(s3)
-
-    candidates = blocking.generate_all_candidates(s1n, s2n, s3n)
+    s1n, s2n, s3n, candidates, gt = pipeline.load_and_prepare()
     labeled, missed = labels.build_pairwise_labels(candidates, gt)
     labels.summarize_labels(labeled, missed)
+
     featured = feat.extract_features(labeled, s1n, s2n, s3n)
+    train_ids, valid_ids = split_entity_ids(gt)
+    train_df = filter_by_entity_ids(featured, train_ids)
+    valid_df = filter_by_entity_ids(featured, valid_ids)
+    print(f"Train: {len(train_ids)} entities / {len(train_df)} pairs, "
+          f"Valid: {len(valid_ids)} entities / {len(valid_df)} pairs")
 
-    train_ids, valid_ids = model.split_entity_ids(gt)
-    train_df = model.filter_by_entity_ids(featured, train_ids)
-    valid_df = model.filter_by_entity_ids(featured, valid_ids)
-
-    trained_model = model.train_lightgbm(train_df, valid_df)
-    model.save_model(trained_model)
+    model = train_lightgbm(train_df, valid_df)
+    save_model(model)
 
     valid_df = valid_df.copy()
-    valid_df["match_probability"] = model.predict_proba(trained_model, valid_df)
-
-    print("\n--- Threshold sweep (macro F0.5) ---")
-    for t in config.THRESHOLD_SWEEP:
-        result = evaluate_at_threshold(valid_df, gt, valid_ids, t)
-        print(f"threshold={t:.2f}  macro_F0.5={result['macro_f0.5']:.4f}  n_entities={result['n_entities']}")
-
-    fp, fn = get_error_examples(valid_df, gt, valid_ids, config.DEFAULT_THRESHOLD)
-    print("\nSample false positives:\n", fp)
-    print("\nSample false negatives:\n", fn)
+    valid_df["match_probability"] = predict_proba(model, valid_df)
+    print("\nSample scored validation pairs:")
+    print(valid_df[["s1_id", "candidate_id", "label", "match_probability"]].sample(min(10, len(valid_df))))

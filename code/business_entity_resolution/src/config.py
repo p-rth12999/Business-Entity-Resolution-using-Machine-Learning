@@ -88,8 +88,31 @@ TFIDF_FALLBACK_TOP_K = 5  # kept for reference / possible small-scale reuse
 # compare records within a sliding window of each other (O(n log n), not
 # O(n*m)). Run twice — sorted by name, then by address — so a typo early in
 # one field can still be caught via the other.
-SORTED_NEIGHBORHOOD_BLOCK_ENABLED = True
-SORTED_NEIGHBORHOOD_WINDOW = 10
+# Window kept small on purpose: at 2-5M rows/source, window=10 alone produced
+# ~54M candidate pairs. Widen this ONLY after confirming (via blocking recall)
+# that it's actually needed — it's the single biggest volume driver.
+# Scalable fuzzy fallback: sort combined records by a normalized key, only
+# compare records within a sliding window of each other (O(n log n), not
+# O(n*m)). Run twice — sorted by name, then by address — so a typo early in
+# one field can still be caught via the other.
+# TEMPORARILY DISABLED: with 30 hours to a deadline, priority is one fast,
+# complete run using just the 4 exact-key blocks. Flip this to True (window
+# is already cut to 2) once you have a baseline recall number and time to
+# spare for a second, slower run.
+SORTED_NEIGHBORHOOD_BLOCK_ENABLED = False
+SORTED_NEIGHBORHOOD_WINDOW = 2
+
+# Safety cap: an exact-key block whose key is shared by more than this many
+# records (on either side) gets dropped for that key. Tightened from 50 -> 15
+# after 50 still let a handful of common keys balloon into millions of pairs.
+MAX_BLOCK_KEY_FREQUENCY = 15
+
+# Disk cache for the expensive normalize+block step (was ~40+ minutes at this
+# data scale). Delete the cache file manually after changing normalize.py or
+# blocking.py logic, or pass --no-cache to main.py.
+CACHE_DIR = PACKAGE_ROOT / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+NORMALIZED_CANDIDATES_CACHE = CACHE_DIR / "normalized_and_candidates.pkl"
 
 # Safety cap: an exact-key block whose key is shared by more than this many
 # records (on either side) gets dropped for that key. Without this, one

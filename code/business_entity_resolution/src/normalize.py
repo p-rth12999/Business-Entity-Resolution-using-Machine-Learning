@@ -69,11 +69,14 @@ def normalize_addresses(raw_addresses: pd.Series) -> pd.DataFrame:
 
     house_number = digit_groups.map(lambda g: g[0] if isinstance(g, list) and g else "")
     postal_code = digit_groups.map(lambda g: max(g, key=len) if isinstance(g, list) and g else "")
-    address_tokens = normalized.str.split().map(lambda toks: set(toks) if isinstance(toks, list) else set())
 
+    # NOTE: no address_tokens (Python set) column here anymore — at tens of
+    # millions of rows, a stored Python object column carried through every
+    # merge is what actually exhausts memory, not row count alone. Address
+    # token overlap is computed on-the-fly from address_normalized strings
+    # using rapidfuzz where needed (blocking.py, features.py) instead.
     return pd.DataFrame({
         "address_normalized": normalized,
-        "address_tokens": address_tokens,
         "house_number": house_number,
         "postal_code": postal_code,
     })

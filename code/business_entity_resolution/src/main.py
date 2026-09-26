@@ -19,21 +19,10 @@ import evaluate
 import predict
 
 
-def _load_and_prep_train():
-    import time
+def _load_and_prep_train(use_cache: bool = True):
+    import pipeline
 
-    s1, s2, s3 = io_utils.load_train_sources()
-    gt = io_utils.load_ground_truth()
-
-    start = time.time()
-    s1n = normalize.normalize_dataframe(s1)
-    s2n = normalize.normalize_dataframe(s2)
-    s3n = normalize.normalize_dataframe(s3)
-    print(f"Normalized all sources in {time.time() - start:.1f}s")
-
-    candidates = blocking.generate_all_candidates(s1n, s2n, s3n)
-    blocking.measure_blocking_recall(candidates, gt)
-
+    s1n, s2n, s3n, candidates, gt = pipeline.load_and_prepare(use_cache=use_cache)
     labeled, missed = labels.build_pairwise_labels(candidates, gt)
     labels.summarize_labels(labeled, missed)
 
@@ -41,8 +30,8 @@ def _load_and_prep_train():
     return gt, featured
 
 
-def cmd_train():
-    gt, featured = _load_and_prep_train()
+def cmd_train(use_cache: bool = True):
+    gt, featured = _load_and_prep_train(use_cache=use_cache)
     train_ids, valid_ids = model.split_entity_ids(gt)
     train_df = model.filter_by_entity_ids(featured, train_ids)
     valid_df = model.filter_by_entity_ids(featured, valid_ids)
@@ -56,8 +45,8 @@ def cmd_train():
     print(f"\nValidation macro F0.5 @ threshold={config.DEFAULT_THRESHOLD}: {result['macro_f0.5']:.4f}")
 
 
-def cmd_evaluate():
-    gt, featured = _load_and_prep_train()
+def cmd_evaluate(use_cache: bool = True):
+    gt, featured = _load_and_prep_train(use_cache=use_cache)
     train_ids, valid_ids = model.split_entity_ids(gt)
     train_df = model.filter_by_entity_ids(featured, train_ids)
     valid_df = model.filter_by_entity_ids(featured, valid_ids)
@@ -79,6 +68,12 @@ def cmd_predict():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Business entity resolution pipeline")
     parser.add_argument("command", choices=["train", "evaluate", "predict"])
+    parser.add_argument("--no-cache", action="store_true", help="Recompute normalize+blocking instead of using the cache")
     args = parser.parse_args()
 
-    {"train": cmd_train, "evaluate": cmd_evaluate, "predict": cmd_predict}[args.command]()
+    if args.command == "train":
+        cmd_train(use_cache=not args.no_cache)
+    elif args.command == "evaluate":
+        cmd_evaluate(use_cache=not args.no_cache)
+    elif args.command == "predict":
+        cmd_predict()
