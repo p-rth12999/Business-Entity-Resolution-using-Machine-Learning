@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+env/
+dataset/
+output/
+submission_staging/
+code/business_entity_resolution/models/
+code/business_entity_resolution/cache/
+*.zip
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
